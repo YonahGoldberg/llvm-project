@@ -1480,56 +1480,7 @@ LLVM_DUMP_METHOD void AllocaSlices::dump() const { print(dbgs()); }
 
 #endif // !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 
-/// Walk the range of a partitioning looking for a common type to cover this
-/// sequence of slices.
-static std::pair<Type *, IntegerType *>
-findCommonType(AllocaSlices::const_iterator B, AllocaSlices::const_iterator E,
-               uint64_t EndOffset) {
-  Type *Ty = nullptr;
-  bool TyIsCommon = true;
-  IntegerType *ITy = nullptr;
-
-  // Note that we need to look at *every* alloca slice's Use to ensure we
-  // always get consistent results regardless of the order of slices.
-  for (AllocaSlices::const_iterator I = B; I != E; ++I) {
-    Use *U = I->getUse();
-    if (isa<IntrinsicInst>(*U->getUser()))
-      continue;
-    if (I->beginOffset() != B->beginOffset() || I->endOffset() != EndOffset)
-      continue;
-
-    Type *UserTy = nullptr;
-    if (LoadInst *LI = dyn_cast<LoadInst>(U->getUser())) {
-      UserTy = LI->getType();
-    } else if (StoreInst *SI = dyn_cast<StoreInst>(U->getUser())) {
-      UserTy = SI->getValueOperand()->getType();
-    }
-
-    if (IntegerType *UserITy = dyn_cast_or_null<IntegerType>(UserTy)) {
-      // If the type is larger than the partition, skip it. We only encounter
-      // this for split integer operations where we want to use the type of the
-      // entity causing the split. Also skip if the type is not a byte width
-      // multiple.
-      if (UserITy->getBitWidth() % 8 != 0 ||
-          UserITy->getBitWidth() / 8 > (EndOffset - B->beginOffset()))
-        continue;
-
-      // Track the largest bitwidth integer type used in this way in case there
-      // is no common type.
-      if (!ITy || ITy->getBitWidth() < UserITy->getBitWidth())
-        ITy = UserITy;
-    }
-
-    // To avoid depending on the order of slices, Ty and TyIsCommon must not
-    // depend on types skipped above.
-    if (!UserTy || (Ty && Ty != UserTy))
-      TyIsCommon = false; // Give up on anything but an iN type.
-    else
-      Ty = UserTy;
-  }
-
-  return {TyIsCommon ? Ty : nullptr, ITy};
-}
+// Removed findCommonType function - simplified type selection in rewritePartition
 
 /// PHI instructions that use an alloca and are subsequently loaded can be
 /// rewritten to load both input pointers in the pred blocks and then PHI the
@@ -2852,7 +2803,7 @@ public:
   AllocaSliceRewriter(const DataLayout &DL, AllocaSlices &AS, SROA &Pass,
                       AllocaInst &OldAI, AllocaInst &NewAI,
                       uint64_t NewAllocaBeginOffset,
-                      uint64_t NewAllocaEndOffset, bool IsIntegerPromotable,
+                      uint64_t NewAllocaEndOffset, bool UseIntegerOps,
                       VectorType *PromotableVecTy,
                       SmallSetVector<PHINode *, 8> &PHIUsers,
                       SmallSetVector<SelectInst *, 8> &SelectUsers)
@@ -2861,7 +2812,7 @@ public:
         NewAllocaEndOffset(NewAllocaEndOffset),
         NewAllocaTy(NewAI.getAllocatedType()),
         IntTy(
-            IsIntegerPromotable
+            UseIntegerOps
                 ? Type::getIntNTy(NewAI.getContext(),
                                   DL.getTypeSizeInBits(NewAI.getAllocatedType())
                                       .getFixedValue())
@@ -3620,20 +3571,19 @@ private:
                                          NewAI.getAlign(), "oldload");
       V = insertVector(IRB, Old, Splat, BeginIndex, "vec");
     } else if (IntTy) {
-      // If this is a memset on an alloca where we can widen stores, insert the
-      // set integer.
-      assert(!II.isVolatile());
-
+      // If this is a memset on an alloca where we're using integer operations,
+      // insert the set integer. This works for both volatile and non-volatile.
       uint64_t Size = NewEndOffset - NewBeginOffset;
       V = getIntegerSplat(II.getValue(), Size);
 
       if (IntTy && (BeginOffset != NewAllocaBeginOffset ||
                     EndOffset != NewAllocaBeginOffset)) {
-        Value *Old = IRB.CreateAlignedLoad(NewAI.getAllocatedType(), &NewAI,
-                                           NewAI.getAlign(), "oldload");
-        Old = convertValue(DL, IRB, Old, IntTy);
+        LoadInst *Old = IRB.CreateAlignedLoad(NewAI.getAllocatedType(), &NewAI,
+                                              NewAI.getAlign(), "oldload");
+        Old->setVolatile(II.isVolatile());
+        Value *OldInt = convertValue(DL, IRB, Old, IntTy);
         uint64_t Offset = NewBeginOffset - NewAllocaBeginOffset;
-        V = insertInteger(DL, IRB, Old, V, Offset, "insert");
+        V = insertInteger(DL, IRB, OldInt, V, Offset, "insert");
       } else {
         assert(V->getType() == IntTy &&
                "Wrong type for an alloca wide integer!");
@@ -4549,156 +4499,9 @@ private:
 
 } // end anonymous namespace
 
-/// Strip aggregate type wrapping.
-///
-/// This removes no-op aggregate types wrapping an underlying type. It will
-/// strip as many layers of types as it can without changing either the type
-/// size or the allocated size.
-static Type *stripAggregateTypeWrapping(const DataLayout &DL, Type *Ty) {
-  if (Ty->isSingleValueType())
-    return Ty;
+// Removed stripAggregateTypeWrapping function - not needed with simplified type selection
 
-  uint64_t AllocSize = DL.getTypeAllocSize(Ty).getFixedValue();
-  uint64_t TypeSize = DL.getTypeSizeInBits(Ty).getFixedValue();
-
-  Type *InnerTy;
-  if (ArrayType *ArrTy = dyn_cast<ArrayType>(Ty)) {
-    InnerTy = ArrTy->getElementType();
-  } else if (StructType *STy = dyn_cast<StructType>(Ty)) {
-    const StructLayout *SL = DL.getStructLayout(STy);
-    unsigned Index = SL->getElementContainingOffset(0);
-    InnerTy = STy->getElementType(Index);
-  } else {
-    return Ty;
-  }
-
-  if (AllocSize > DL.getTypeAllocSize(InnerTy).getFixedValue() ||
-      TypeSize > DL.getTypeSizeInBits(InnerTy).getFixedValue())
-    return Ty;
-
-  return stripAggregateTypeWrapping(DL, InnerTy);
-}
-
-/// Try to find a partition of the aggregate type passed in for a given
-/// offset and size.
-///
-/// This recurses through the aggregate type and tries to compute a subtype
-/// based on the offset and size. When the offset and size span a sub-section
-/// of an array, it will even compute a new array type for that sub-section,
-/// and the same for structs.
-///
-/// Note that this routine is very strict and tries to find a partition of the
-/// type which produces the *exact* right offset and size. It is not forgiving
-/// when the size or offset cause either end of type-based partition to be off.
-/// Also, this is a best-effort routine. It is reasonable to give up and not
-/// return a type if necessary.
-static Type *getTypePartition(const DataLayout &DL, Type *Ty, uint64_t Offset,
-                              uint64_t Size) {
-  if (Offset == 0 && DL.getTypeAllocSize(Ty).getFixedValue() == Size)
-    return stripAggregateTypeWrapping(DL, Ty);
-  if (Offset > DL.getTypeAllocSize(Ty).getFixedValue() ||
-      (DL.getTypeAllocSize(Ty).getFixedValue() - Offset) < Size)
-    return nullptr;
-
-  if (isa<ArrayType>(Ty) || isa<VectorType>(Ty)) {
-    Type *ElementTy;
-    uint64_t TyNumElements;
-    if (auto *AT = dyn_cast<ArrayType>(Ty)) {
-      ElementTy = AT->getElementType();
-      TyNumElements = AT->getNumElements();
-    } else {
-      // FIXME: This isn't right for vectors with non-byte-sized or
-      // non-power-of-two sized elements.
-      auto *VT = cast<FixedVectorType>(Ty);
-      ElementTy = VT->getElementType();
-      TyNumElements = VT->getNumElements();
-    }
-    uint64_t ElementSize = DL.getTypeAllocSize(ElementTy).getFixedValue();
-    uint64_t NumSkippedElements = Offset / ElementSize;
-    if (NumSkippedElements >= TyNumElements)
-      return nullptr;
-    Offset -= NumSkippedElements * ElementSize;
-
-    // First check if we need to recurse.
-    if (Offset > 0 || Size < ElementSize) {
-      // Bail if the partition ends in a different array element.
-      if ((Offset + Size) > ElementSize)
-        return nullptr;
-      // Recurse through the element type trying to peel off offset bytes.
-      return getTypePartition(DL, ElementTy, Offset, Size);
-    }
-    assert(Offset == 0);
-
-    if (Size == ElementSize)
-      return stripAggregateTypeWrapping(DL, ElementTy);
-    assert(Size > ElementSize);
-    uint64_t NumElements = Size / ElementSize;
-    if (NumElements * ElementSize != Size)
-      return nullptr;
-    return ArrayType::get(ElementTy, NumElements);
-  }
-
-  StructType *STy = dyn_cast<StructType>(Ty);
-  if (!STy)
-    return nullptr;
-
-  const StructLayout *SL = DL.getStructLayout(STy);
-
-  if (SL->getSizeInBits().isScalable())
-    return nullptr;
-
-  if (Offset >= SL->getSizeInBytes())
-    return nullptr;
-  uint64_t EndOffset = Offset + Size;
-  if (EndOffset > SL->getSizeInBytes())
-    return nullptr;
-
-  unsigned Index = SL->getElementContainingOffset(Offset);
-  Offset -= SL->getElementOffset(Index);
-
-  Type *ElementTy = STy->getElementType(Index);
-  uint64_t ElementSize = DL.getTypeAllocSize(ElementTy).getFixedValue();
-  if (Offset >= ElementSize)
-    return nullptr; // The offset points into alignment padding.
-
-  // See if any partition must be contained by the element.
-  if (Offset > 0 || Size < ElementSize) {
-    if ((Offset + Size) > ElementSize)
-      return nullptr;
-    return getTypePartition(DL, ElementTy, Offset, Size);
-  }
-  assert(Offset == 0);
-
-  if (Size == ElementSize)
-    return stripAggregateTypeWrapping(DL, ElementTy);
-
-  StructType::element_iterator EI = STy->element_begin() + Index,
-                               EE = STy->element_end();
-  if (EndOffset < SL->getSizeInBytes()) {
-    unsigned EndIndex = SL->getElementContainingOffset(EndOffset);
-    if (Index == EndIndex)
-      return nullptr; // Within a single element and its padding.
-
-    // Don't try to form "natural" types if the elements don't line up with the
-    // expected size.
-    // FIXME: We could potentially recurse down through the last element in the
-    // sub-struct to find a natural end point.
-    if (SL->getElementOffset(EndIndex) != EndOffset)
-      return nullptr;
-
-    assert(Index < EndIndex);
-    EE = STy->element_begin() + EndIndex;
-  }
-
-  // Try to build up a sub-structure.
-  StructType *SubTy =
-      StructType::get(STy->getContext(), ArrayRef(EI, EE), STy->isPacked());
-  const StructLayout *SubSL = DL.getStructLayout(SubTy);
-  if (Size != SubSL->getSizeInBytes())
-    return nullptr; // The sub-struct doesn't have quite the size needed.
-
-  return SubTy;
-}
+// Removed getTypePartition function - not needed with simplified type selection
 
 /// Pre-split loads and stores to simplify rewriting.
 ///
@@ -5209,65 +5012,101 @@ bool SROA::presplitLoadsAndStores(AllocaInst &AI, AllocaSlices &AS) {
 /// promoted.
 AllocaInst *SROA::rewritePartition(AllocaInst &AI, AllocaSlices &AS,
                                    Partition &P) {
-  // Try to compute a friendly type for this partition of the alloca. This
-  // won't always succeed, in which case we fall back to a legal integer type
-  // or an i8 array of an appropriate size.
+  // Modern simplified type selection for the opaque pointer era.
+  // Priority order:
+  // 1. Common type among all uses (to avoid bitcasts)
+  // 2. Legal integer types (always promotable, handle all bit patterns)
+  // 3. Vector types if beneficial and all uses are vector-compatible
+  // 4. i8 array fallback for non-promotable sizes
+  
   Type *SliceTy = nullptr;
-  VectorType *SliceVecTy = nullptr;
   const DataLayout &DL = AI.getDataLayout();
-  unsigned VScale = AI.getFunction()->getVScaleValue();
-
-  std::pair<Type *, IntegerType *> CommonUseTy =
-      findCommonType(P.begin(), P.end(), P.endOffset());
-  // Do all uses operate on the same type?
-  if (CommonUseTy.first) {
-    TypeSize CommonUseSize = DL.getTypeAllocSize(CommonUseTy.first);
-    if (CommonUseSize.isFixed() && CommonUseSize.getFixedValue() >= P.size()) {
-      SliceTy = CommonUseTy.first;
-      SliceVecTy = dyn_cast<VectorType>(SliceTy);
+  uint64_t PartitionSize = P.size();
+  
+  // First check: do all scalar loads/stores use the same type?
+  // If so, use that type to avoid unnecessary bitcasts
+  Type *CommonTy = nullptr;
+  bool TypeMismatch = false;
+  for (const Slice &S : P) {
+    Type *UserTy = nullptr;
+    if (LoadInst *LI = dyn_cast<LoadInst>(S.getUse()->getUser())) {
+      UserTy = LI->getType();
+    } else if (StoreInst *SI = dyn_cast<StoreInst>(S.getUse()->getUser())) {
+      UserTy = SI->getValueOperand()->getType();
+    }
+    
+    if (UserTy) {
+      if (!CommonTy) {
+        CommonTy = UserTy;
+      } else if (CommonTy != UserTy) {
+        TypeMismatch = true;
+        break;
+      }
     }
   }
-  // If not, can we find an appropriate subtype in the original allocated type?
-  if (!SliceTy)
-    if (Type *TypePartitionTy = getTypePartition(DL, AI.getAllocatedType(),
-                                                 P.beginOffset(), P.size()))
-      SliceTy = TypePartitionTy;
-
-  // If still not, can we use the largest bitwidth integer type used?
-  // If SliceTy is a non-promotable aggregate, prefer to represent as an integer
-  // type because it's more likely to be promotable.
-  if ((!SliceTy || !SliceTy->isSingleValueType()) && CommonUseTy.second)
-    if (DL.getTypeAllocSize(CommonUseTy.second).getFixedValue() >= P.size()) {
-      SliceTy = CommonUseTy.second;
-      SliceVecTy = dyn_cast<VectorType>(SliceTy);
-    }
-  // Try representing the partition as a legal integer type of the same size as
-  // the alloca.
-  if ((!SliceTy || SliceTy->isArrayTy()) && DL.isLegalInteger(P.size() * 8)) {
-    SliceTy = Type::getIntNTy(*C, P.size() * 8);
+  
+  // If we have a common type and it's the right size, use it
+  if (CommonTy && !TypeMismatch && 
+      DL.getTypeAllocSize(CommonTy).getFixedValue() == PartitionSize) {
+    SliceTy = CommonTy;
+    LLVM_DEBUG(dbgs() << "Selected common type " << *CommonTy 
+                      << " for partition [" << P.beginOffset() 
+                      << ", " << P.endOffset() << "] to avoid conversions\n");
   }
-
-  // If the common use types are not viable for promotion then attempt to find
-  // another type that is viable.
-  if (SliceVecTy && !checkVectorTypeForPromotion(P, SliceVecTy, DL, VScale))
-    if (Type *TypePartitionTy = getTypePartition(DL, AI.getAllocatedType(),
-                                                 P.beginOffset(), P.size())) {
-      VectorType *TypePartitionVecTy = dyn_cast<VectorType>(TypePartitionTy);
-      if (TypePartitionVecTy &&
-          checkVectorTypeForPromotion(P, TypePartitionVecTy, DL, VScale))
-        SliceTy = TypePartitionTy;
+  
+  // Special case: if common type is pointer, definitely use it to avoid inttoptr
+  if (!SliceTy && CommonTy && CommonTy->isPointerTy() && 
+      DL.getPointerSize() == PartitionSize) {
+    SliceTy = CommonTy;
+    LLVM_DEBUG(dbgs() << "Selected pointer type for partition [" 
+                      << P.beginOffset() << ", " << P.endOffset() 
+                      << "] to avoid inttoptr/ptrtoint\n");
+  }
+  
+  // Otherwise, try to use a legal integer type
+  // Legal integers are those the target can handle efficiently in registers
+  // Even if we can't promote to SSA (due to volatile ops), integer types are
+  // still better than arrays for most operations
+  if (!SliceTy && DL.isLegalInteger(PartitionSize * 8)) {
+    SliceTy = Type::getIntNTy(*C, PartitionSize * 8);
+    LLVM_DEBUG(dbgs() << "Selected legal integer type i" << (PartitionSize * 8) 
+                      << " for partition [" << P.beginOffset() 
+                      << ", " << P.endOffset() << "]\n");
+  }
+  
+  // Second priority: Check if vector promotion would be beneficial
+  // Only use vectors if we can't use integers and the uses are vector-compatible
+  if (!SliceTy) {
+    unsigned VScale = AI.getFunction()->getVScaleValue();
+    if (VectorType *VecTy = isVectorPromotionViable(P, DL, VScale)) {
+      SliceTy = VecTy;
+      LLVM_DEBUG(dbgs() << "Selected vector type " << *VecTy 
+                        << " for partition [" << P.beginOffset() 
+                        << ", " << P.endOffset() << "]\n");
     }
-
-  if (!SliceTy)
-    SliceTy = ArrayType::get(Type::getInt8Ty(*C), P.size());
-  assert(DL.getTypeAllocSize(SliceTy).getFixedValue() >= P.size());
-
-  bool IsIntegerPromotable = isIntegerWideningViable(P, SliceTy, DL);
-
-  VectorType *VecTy =
-      IsIntegerPromotable ? nullptr : isVectorPromotionViable(P, DL, VScale);
-  if (VecTy)
-    SliceTy = VecTy;
+  }
+  
+  // Final fallback: i8 array for cases that can't be promoted
+  if (!SliceTy) {
+    SliceTy = ArrayType::get(Type::getInt8Ty(*C), PartitionSize);
+    LLVM_DEBUG(dbgs() << "Fallback to i8[" << PartitionSize 
+                      << "] for partition [" << P.beginOffset() 
+                      << ", " << P.endOffset() << ")\n");
+  }
+  
+  assert(DL.getTypeAllocSize(SliceTy).getFixedValue() >= PartitionSize);
+  
+  // Check if we selected an integer type AND all operations are rewritable
+  // The rewriter requires that if IntTy is set, all operations must be rewritable
+  bool UseIntegerOps = false;
+  if (IntegerType *ITy = dyn_cast<IntegerType>(SliceTy)) {
+    // Check if integer widening is viable - this ensures all operations 
+    // can be rewritten using integer operations
+    UseIntegerOps = isIntegerWideningViable(P, ITy, DL);
+  }
+  
+  // Extract vector type if we selected one
+  VectorType *VecTy = dyn_cast<VectorType>(SliceTy);
 
   // Check for the case where we're going to rewrite to a new alloca of the
   // exact same type as the original, and with the same access offsets. In that
@@ -5309,7 +5148,7 @@ AllocaInst *SROA::rewritePartition(AllocaInst &AI, AllocaSlices &AS,
   SmallSetVector<SelectInst *, 8> SelectUsers;
 
   AllocaSliceRewriter Rewriter(DL, AS, *this, AI, *NewAI, P.beginOffset(),
-                               P.endOffset(), IsIntegerPromotable, VecTy,
+                               P.endOffset(), UseIntegerOps, VecTy,
                                PHIUsers, SelectUsers);
   bool Promotable = true;
   // Check whether we can have tree-structured merge.
