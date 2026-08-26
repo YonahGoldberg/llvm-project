@@ -5379,6 +5379,52 @@ static FixedVectorType *tryCanonicalizeStructToVector(StructType *STy,
   return VTy;
 }
 
+/// Return true if every live slice in the partition is a splittable memcpy.
+/// Lifetime and debug intrinsics do not access the stored value and can be
+/// ignored.
+static bool isMemCpyOnlyPartition(Partition &P) {
+  bool HasMemCpy = false;
+  auto IsIgnorableOrMemCpySlice = [&](const Slice &S) {
+    if (S.isDead())
+      return true;
+    auto *U = S.getUse();
+    if (!U)
+      return true;
+
+    User *Usr = U->getUser();
+    if (isa<LifetimeIntrinsic>(Usr) || isa<DbgInfoIntrinsic>(Usr))
+      return true;
+
+    auto *MCI = dyn_cast<MemCpyInst>(Usr);
+    if (!MCI || MCI->isVolatile() || !isa<ConstantInt>(MCI->getLength()) ||
+        !S.isSplittable())
+      return false;
+
+    HasMemCpy = true;
+    return true;
+  };
+
+  for (const Slice &S : P)
+    if (!IsIgnorableOrMemCpySlice(S))
+      return false;
+
+  for (const Slice *S : P.splitSliceTails())
+    if (!IsIgnorableOrMemCpySlice(*S))
+      return false;
+
+  return HasMemCpy;
+}
+
+/// Return true if Ty contains a pointer that cannot be safely copied through
+/// an integer load and store.
+static bool containsNonIntegralPointer(Type *Ty, const DataLayout &DL) {
+  if (Ty->isPointerTy())
+    return DL.isNonIntegralPointerType(Ty);
+  return llvm::any_of(Ty->subtypes(), [&](Type *SubTy) {
+    return containsNonIntegralPointer(SubTy, DL);
+  });
+}
+
 /// Select a partition type for an alloca partition.
 ///
 /// Try to compute a friendly type for this partition of the alloca. This
@@ -5452,6 +5498,18 @@ selectPartitionType(Partition &P, const DataLayout &DL, AllocaInst &AI,
       LogSelection("common-type", CommonUseTy, nullptr, IntWiden);
       return {CommonUseTy, IntWiden, nullptr};
     }
+  }
+
+  // When the partition only carries bytes between memcpy intrinsics, its
+  // allocated type does not provide useful type information. Canonicalize
+  // small partitions to a legal integer, which SROA can promote without
+  // relying on integer legalization in the backend.
+  if (P.size() <= 8 && DL.isLegalInteger(P.size() * 8) &&
+      isMemCpyOnlyPartition(P) &&
+      !containsNonIntegralPointer(AI.getAllocatedType(), DL)) {
+    Type *IntTy = Type::getIntNTy(C, P.size() * 8);
+    LogSelection("memcpy-only-int", IntTy, nullptr, true);
+    return {IntTy, true, nullptr};
   }
 
   // Can we find an appropriate subtype in the original allocated
