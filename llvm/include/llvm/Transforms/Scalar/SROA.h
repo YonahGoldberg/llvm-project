@@ -37,8 +37,8 @@ class SROAPass : public OptionalPassInfoMixin<SROAPass> {
 public:
   /// If \p PreserveCFG is set, then the pass is not allowed to modify CFG
   /// in any way, even if it would update CFG analyses.
-  /// If \p AggregateToVector is set, then the pass will try to convert
-  /// allocas of homogeneous structs into vector allocas.
+  /// If \p AggregateToVector is set, then the pass will try to canonicalize
+  /// memory-intrinsic-only partitions to promotable vector or integer types.
   LLVM_ABI SROAPass(SROAOptions Options);
 
   /// Run the pass over the function.

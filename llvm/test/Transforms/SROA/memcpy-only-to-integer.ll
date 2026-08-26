@@ -1,4 +1,6 @@
-; RUN: opt -passes=sroa -S < %s | FileCheck %s
+; RUN: opt -passes='sroa<aggregate-to-vector>' -S < %s | FileCheck %s
+; RUN: opt -passes=sroa -S < %s | FileCheck %s --check-prefix=EARLY
+; RUN: opt -passes='default<O3>' -S < %s | FileCheck %s --check-prefix=PIPELINE
 
 target datalayout = "e-p:64:64-pe4:64:64-n8:16:32:64"
 
@@ -20,6 +22,13 @@ define void @integer_array(ptr %dst, ptr %src) {
 }
 
 define void @float_array(ptr %dst, ptr %src) {
+; EARLY-LABEL: define void @float_array(
+; EARLY:         [[A:%.*]] = alloca [2 x float], align 4
+; EARLY:         call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[A]], ptr align 4 [[SRC:%.*]], i64 8, i1 false)
+; EARLY:         call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[DST:%.*]], ptr align 4 [[A]], i64 8, i1 false)
+; PIPELINE-LABEL: define void @float_array(
+; PIPELINE:         [[V:%.*]] = load i64, ptr [[SRC:%.*]], align 4
+; PIPELINE-NEXT:    store i64 [[V]], ptr [[DST:%.*]], align 4
 ; CHECK-LABEL: define void @float_array(
 ; CHECK-NEXT:    [[V:%.*]] = load i64, ptr [[SRC:%.*]], align 4
 ; CHECK-NEXT:    store i64 [[V]], ptr [[DST:%.*]], align 4

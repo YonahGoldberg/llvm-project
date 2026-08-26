@@ -5301,12 +5301,21 @@ bool SROA::presplitLoadsAndStores(AllocaInst &AI, AllocaSlices &AS) {
   return true;
 }
 
-/// Try to canonicalize a homogeneous struct partition to a vector type.
+/// Return true if Ty contains a pointer that cannot be safely copied through
+/// an integer load and store.
+static bool containsNonIntegralPointer(Type *Ty, const DataLayout &DL) {
+  if (Ty->isPointerTy())
+    return DL.isNonIntegralPointerType(Ty);
+  return llvm::any_of(Ty->subtypes(), [&](Type *SubTy) {
+    return containsNonIntegralPointer(SubTy, DL);
+  });
+}
+
+/// Try to canonicalize a memory-intrinsic-only partition.
 ///
-/// We can do this if all the elements of the struct are the same and the
-/// corresponding vector has the same byte-level layout. This can sometimes
-/// eliminate allocas because structs cannot get promoted to LLVM values, but
-/// vectors can.
+/// Small memcpy-only partitions can use a legal integer type. Otherwise, a
+/// homogeneous struct can use a vector with the same byte-level layout. These
+/// canonical types can eliminate allocas that their aggregate types cannot.
 ///
 /// We only apply this transformation when all users of the partition are memory
 /// intrinsics. Otherwise, if there is a load or store of some other type to the
@@ -5324,9 +5333,48 @@ bool SROA::presplitLoadsAndStores(AllocaInst &AI, AllocaSlices &AS) {
 ///
 /// As such, we only apply this transformation after memcpyopt has run. We gate
 /// this transformation by the "AggregateToVector" pass option.
-static FixedVectorType *tryCanonicalizeStructToVector(StructType *STy,
-                                                      Partition &P,
+static Type *tryCanonicalizeMemIntrinsicOnlyPartition(Type *Ty, Partition &P,
                                                       const DataLayout &DL) {
+  bool HasMemCpy = false;
+  bool IsMemCpyOnly = true;
+  bool IsMemIntrinsicOnly = true;
+  auto ClassifySlice = [&](const Slice &S) {
+    if (S.isDead())
+      return;
+    auto *U = S.getUse();
+    if (!U)
+      return;
+
+    User *Usr = U->getUser();
+    if (isa<LifetimeIntrinsic>(Usr) || isa<DbgInfoIntrinsic>(Usr))
+      return;
+
+    IsMemIntrinsicOnly &= isa<MemIntrinsic>(Usr);
+    auto *MCI = dyn_cast<MemCpyInst>(Usr);
+    if (!MCI || MCI->isVolatile() || !isa<ConstantInt>(MCI->getLength()) ||
+        !S.isSplittable()) {
+      IsMemCpyOnly = false;
+      return;
+    }
+    HasMemCpy = true;
+  };
+
+  for (const Slice &S : P)
+    ClassifySlice(S);
+  for (const Slice *S : P.splitSliceTails())
+    ClassifySlice(*S);
+
+  if (HasMemCpy && IsMemCpyOnly && P.size() <= 8 &&
+      DL.isLegalInteger(P.size() * 8) && !containsNonIntegralPointer(Ty, DL))
+    return Type::getIntNTy(Ty->getContext(), P.size() * 8);
+
+  if (!IsMemIntrinsicOnly)
+    return nullptr;
+
+  auto *STy = dyn_cast<StructType>(Ty);
+  if (!STy)
+    return nullptr;
+
   unsigned NumElts = STy->getNumElements();
 
   Type *EltTy = STy->getElementType(0);
@@ -5354,75 +5402,7 @@ static FixedVectorType *tryCanonicalizeStructToVector(StructType *STy,
   if (StructSize != VectorSize)
     return nullptr;
 
-  auto IsIgnorableOrMemIntrinsicSlice = [](const Slice &S) {
-    if (S.isDead())
-      return true;
-    auto *U = S.getUse();
-    if (!U)
-      return true;
-
-    User *Usr = U->getUser();
-    if (isa<LifetimeIntrinsic>(Usr) || isa<DbgInfoIntrinsic>(Usr))
-      return true;
-
-    return isa<MemIntrinsic>(Usr);
-  };
-
-  for (const Slice &S : P)
-    if (!IsIgnorableOrMemIntrinsicSlice(S))
-      return nullptr;
-
-  for (const Slice *S : P.splitSliceTails())
-    if (!IsIgnorableOrMemIntrinsicSlice(*S))
-      return nullptr;
-
   return VTy;
-}
-
-/// Return true if every live slice in the partition is a splittable memcpy.
-/// Lifetime and debug intrinsics do not access the stored value and can be
-/// ignored.
-static bool isMemCpyOnlyPartition(Partition &P) {
-  bool HasMemCpy = false;
-  auto IsIgnorableOrMemCpySlice = [&](const Slice &S) {
-    if (S.isDead())
-      return true;
-    auto *U = S.getUse();
-    if (!U)
-      return true;
-
-    User *Usr = U->getUser();
-    if (isa<LifetimeIntrinsic>(Usr) || isa<DbgInfoIntrinsic>(Usr))
-      return true;
-
-    auto *MCI = dyn_cast<MemCpyInst>(Usr);
-    if (!MCI || MCI->isVolatile() || !isa<ConstantInt>(MCI->getLength()) ||
-        !S.isSplittable())
-      return false;
-
-    HasMemCpy = true;
-    return true;
-  };
-
-  for (const Slice &S : P)
-    if (!IsIgnorableOrMemCpySlice(S))
-      return false;
-
-  for (const Slice *S : P.splitSliceTails())
-    if (!IsIgnorableOrMemCpySlice(*S))
-      return false;
-
-  return HasMemCpy;
-}
-
-/// Return true if Ty contains a pointer that cannot be safely copied through
-/// an integer load and store.
-static bool containsNonIntegralPointer(Type *Ty, const DataLayout &DL) {
-  if (Ty->isPointerTy())
-    return DL.isNonIntegralPointerType(Ty);
-  return llvm::any_of(Ty->subtypes(), [&](Type *SubTy) {
-    return containsNonIntegralPointer(SubTy, DL);
-  });
 }
 
 /// Select a partition type for an alloca partition.
@@ -5500,22 +5480,24 @@ selectPartitionType(Partition &P, const DataLayout &DL, AllocaInst &AI,
     }
   }
 
-  // When the partition only carries bytes between memcpy intrinsics, its
-  // allocated type does not provide useful type information. Canonicalize
-  // small partitions to a legal integer, which SROA can promote without
-  // relying on integer legalization in the backend.
-  if (P.size() <= 8 && DL.isLegalInteger(P.size() * 8) &&
-      isMemCpyOnlyPartition(P) &&
-      !containsNonIntegralPointer(AI.getAllocatedType(), DL)) {
-    Type *IntTy = Type::getIntNTy(C, P.size() * 8);
-    LogSelection("memcpy-only-int", IntTy, nullptr, true);
-    return {IntTy, true, nullptr};
-  }
-
   // Can we find an appropriate subtype in the original allocated
   // type?
-  if (Type *TypePartitionTy = getTypePartition(DL, AI.getAllocatedType(),
-                                               P.beginOffset(), P.size())) {
+  Type *TypePartitionTy =
+      getTypePartition(DL, AI.getAllocatedType(), P.beginOffset(), P.size());
+
+  // Try memory-intrinsic-only canonicalization when requested. Running this
+  // too early can hide memcpy chains from MemCpyOpt.
+  if (AggregateToVector && TypePartitionTy) {
+    if (Type *CanonicalTy =
+            tryCanonicalizeMemIntrinsicOnlyPartition(TypePartitionTy, P, DL)) {
+      bool IsIntTy = CanonicalTy->isIntegerTy();
+      LogSelection(IsIntTy ? "memcpy-only-int" : "struct-fallback-vecty",
+                   CanonicalTy, nullptr, IsIntTy);
+      return {CanonicalTy, IsIntTy, nullptr};
+    }
+  }
+
+  if (TypePartitionTy) {
     // If the partition is an integer array that can be spanned by a legal
     // integer type, prefer to represent it as a legal integer type because
     // it's more likely to be promotable.
@@ -5539,17 +5521,6 @@ selectPartitionType(Partition &P, const DataLayout &DL, AllocaInst &AI,
         isIntegerWideningViable(P, LargestIntTy, DL)) {
       LogSelection("largest-int-int-widen", LargestIntTy, nullptr, true);
       return {LargestIntTy, true, nullptr};
-    }
-
-    // Try homogeneous struct to vector canonicalization when requested. Running
-    // this too early can hide memcpy chains from MemCpyOpt.
-    if (AggregateToVector) {
-      if (auto *STy = dyn_cast<StructType>(TypePartitionTy)) {
-        if (auto *VTy = tryCanonicalizeStructToVector(STy, P, DL)) {
-          LogSelection("struct-fallback-vecty", VTy, nullptr, false);
-          return {VTy, false, nullptr};
-        }
-      }
     }
 
     // Fallback to TypePartitionTy and we probably won't promote.
