@@ -5502,9 +5502,11 @@ selectPartitionType(Partition &P, const DataLayout &DL, AllocaInst &AI,
 
   // When the partition only carries bytes between memcpy intrinsics, its
   // allocated type does not provide useful type information. Canonicalize
-  // small partitions to a legal integer, which SROA can promote without
+  // small allocations to a legal integer, which SROA can promote without
   // relying on integer legalization in the backend.
-  if (P.size() <= 8 && DL.isLegalInteger(P.size() * 8) &&
+  std::optional<TypeSize> AllocSize = AI.getAllocationSize(DL);
+  if (AllocSize && AllocSize->isFixed() && AllocSize->getFixedValue() <= 8 &&
+      P.size() <= 8 && DL.isLegalInteger(P.size() * 8) &&
       isMemCpyOnlyPartition(P) &&
       !containsNonIntegralPointer(AI.getAllocatedType(), DL)) {
     Type *IntTy = Type::getIntNTy(C, P.size() * 8);
