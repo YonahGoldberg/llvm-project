@@ -52,6 +52,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NVVMIntrinsicUtils.h"
 #include "llvm/IR/Type.h"
@@ -81,6 +82,30 @@
 #define DEBUG_TYPE "nvptx-lower"
 
 using namespace llvm;
+
+static bool hasNonDefaultL2EvictionHint(const MDNode *Node) {
+  if (!Node)
+    return false;
+
+  bool HasNonDefaultL2Eviction = false;
+  for (unsigned I = 0; I + 1 < Node->getNumOperands(); I += 2) {
+    const auto *Key = dyn_cast_or_null<MDString>(Node->getOperand(I));
+    const auto *Value = dyn_cast_or_null<MDString>(Node->getOperand(I + 1));
+    if (!Key || !Value || Key->getString() != "nvvm.l2_eviction")
+      continue;
+
+    if (Value->getString() == "normal")
+      HasNonDefaultL2Eviction = false;
+    else if (Value->getString() == "first" || Value->getString() == "last")
+      HasNonDefaultL2Eviction = true;
+  }
+  return HasNonDefaultL2Eviction;
+}
+
+static bool isGlobalOrGenericAddressSpace(unsigned AS) {
+  return AS == static_cast<unsigned>(NVPTX::AddressSpace::Global) ||
+         AS == static_cast<unsigned>(NVPTX::AddressSpace::Generic);
+}
 
 static cl::opt<bool> sched4reg(
     "nvptx-sched4reg",
@@ -1179,6 +1204,37 @@ NVPTXTargetLowering::NVPTXTargetLowering(const NVPTXTargetMachine &TM,
   // Custom lowering for bswap
   setOperationAction(ISD::BSWAP, {MVT::i16, MVT::i32, MVT::i64, MVT::v2i16},
                      Custom);
+}
+
+bool NVPTXTargetLowering::findOptimalMemOpLowering(
+    LLVMContext &Context, std::vector<EVT> &MemOps, unsigned Limit,
+    const MemOp &Op, unsigned DstAS, unsigned SrcAS,
+    const AttributeList &FuncAttributes, EVT *LargestVT) const {
+  bool HasDstL2Eviction =
+      hasNonDefaultL2EvictionHint(Op.getDstMemCacheHint()) &&
+      isGlobalOrGenericAddressSpace(DstAS);
+  bool HasSrcL2Eviction =
+      Op.isMemcpy() && !Op.isMemcpyStrSrc() &&
+      hasNonDefaultL2EvictionHint(Op.getSrcMemCacheHint()) &&
+      isGlobalOrGenericAddressSpace(SrcAS);
+
+  // PTX only supports non-default L2 eviction priorities on 256-bit vector
+  // memory operations. Preserve such hints when a memcpy can be expanded
+  // entirely into naturally aligned operations of that size.
+  if (STI.hasL2EvictionHint() && (HasDstL2Eviction || HasSrcL2Eviction) &&
+      !Op.isVolatile() && Op.size() >= 32 && Op.size() % 32 == 0 &&
+      Op.isAligned(Align(32))) {
+    uint64_t NumMemOps = Op.size() / 32;
+    if (NumMemOps > Limit)
+      return false;
+    MemOps.assign(NumMemOps, MVT::v4i64);
+    if (LargestVT)
+      *LargestVT = MVT::v4i64;
+    return true;
+  }
+
+  return TargetLowering::findOptimalMemOpLowering(
+      Context, MemOps, Limit, Op, DstAS, SrcAS, FuncAttributes, LargestVT);
 }
 
 TargetLoweringBase::LegalizeTypeAction

@@ -566,37 +566,47 @@ define void @test_memcpy_32bytes(ptr addrspace(1) %dest, ptr addrspace(1) %src) 
 ; Aligned, 32-byte-multiple memcpys use PTX-legal 256-bit vector accesses so
 ; both source and destination L2 eviction hints can be preserved.
 define void @test_memcpy_32bytes_aligned(ptr addrspace(1) %dest, ptr addrspace(1) %src) {
-; CHECK-LABEL: test_memcpy_32bytes_aligned(
-; CHECK:    ld.global.b64 %rd3, [%rd2+24];
-; CHECK:    st.global.b64 [%rd1+24], %rd3;
-; CHECK:    ld.global.b64 %rd4, [%rd2+16];
-; CHECK:    st.global.b64 [%rd1+16], %rd4;
-; CHECK:    ld.global.b64 %rd5, [%rd2+8];
-; CHECK:    st.global.b64 [%rd1+8], %rd5;
-; CHECK:    ld.global.b64 %rd6, [%rd2];
-; CHECK:    st.global.b64 [%rd1], %rd6;
+; SM80-LABEL: test_memcpy_32bytes_aligned(
+; SM80:    ld.global.b64 %rd3, [%rd2+24];
+; SM80:    st.global.b64 [%rd1+24], %rd3;
+; SM80:    ld.global.b64 %rd4, [%rd2+16];
+; SM80:    st.global.b64 [%rd1+16], %rd4;
+; SM80:    ld.global.b64 %rd5, [%rd2+8];
+; SM80:    st.global.b64 [%rd1+8], %rd5;
+; SM80:    ld.global.b64 %rd6, [%rd2];
+; SM80:    st.global.b64 [%rd1], %rd6;
+;
+; SM100-LABEL: test_memcpy_32bytes_aligned(
+; SM100:    ld.global.L2::evict_last.v4.b64 {%rd3, %rd4, %rd5, %rd6}, [%rd2];
+; SM100:    st.global.L2::evict_first.v4.b64 [%rd1], {%rd3, %rd4, %rd5, %rd6};
   call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) align 32 %dest, ptr addrspace(1) align 32 %src, i64 32, i1 false), !mem.cache_hint !107
   ret void
 }
 
 define void @test_memcpy_64bytes_aligned(ptr addrspace(1) %dest, ptr addrspace(1) %src) {
-; CHECK-LABEL: test_memcpy_64bytes_aligned(
-; CHECK:    ld.global.b64 %rd3, [%rd2+56];
-; CHECK:    st.global.b64 [%rd1+56], %rd3;
-; CHECK:    ld.global.b64 %rd4, [%rd2+48];
-; CHECK:    st.global.b64 [%rd1+48], %rd4;
-; CHECK:    ld.global.b64 %rd5, [%rd2+40];
-; CHECK:    st.global.b64 [%rd1+40], %rd5;
-; CHECK:    ld.global.b64 %rd6, [%rd2+32];
-; CHECK:    st.global.b64 [%rd1+32], %rd6;
-; CHECK:    ld.global.b64 %rd7, [%rd2+24];
-; CHECK:    st.global.b64 [%rd1+24], %rd7;
-; CHECK:    ld.global.b64 %rd8, [%rd2+16];
-; CHECK:    st.global.b64 [%rd1+16], %rd8;
-; CHECK:    ld.global.b64 %rd9, [%rd2+8];
-; CHECK:    st.global.b64 [%rd1+8], %rd9;
-; CHECK:    ld.global.b64 %rd10, [%rd2];
-; CHECK:    st.global.b64 [%rd1], %rd10;
+; SM80-LABEL: test_memcpy_64bytes_aligned(
+; SM80:    ld.global.b64 %rd3, [%rd2+56];
+; SM80:    st.global.b64 [%rd1+56], %rd3;
+; SM80:    ld.global.b64 %rd4, [%rd2+48];
+; SM80:    st.global.b64 [%rd1+48], %rd4;
+; SM80:    ld.global.b64 %rd5, [%rd2+40];
+; SM80:    st.global.b64 [%rd1+40], %rd5;
+; SM80:    ld.global.b64 %rd6, [%rd2+32];
+; SM80:    st.global.b64 [%rd1+32], %rd6;
+; SM80:    ld.global.b64 %rd7, [%rd2+24];
+; SM80:    st.global.b64 [%rd1+24], %rd7;
+; SM80:    ld.global.b64 %rd8, [%rd2+16];
+; SM80:    st.global.b64 [%rd1+16], %rd8;
+; SM80:    ld.global.b64 %rd9, [%rd2+8];
+; SM80:    st.global.b64 [%rd1+8], %rd9;
+; SM80:    ld.global.b64 %rd10, [%rd2];
+; SM80:    st.global.b64 [%rd1], %rd10;
+;
+; SM100-LABEL: test_memcpy_64bytes_aligned(
+; SM100:    ld.global.L2::evict_last.v4.b64 {%rd3, %rd4, %rd5, %rd6}, [%rd2+32];
+; SM100:    st.global.L2::evict_first.v4.b64 [%rd1+32], {%rd3, %rd4, %rd5, %rd6};
+; SM100:    ld.global.L2::evict_last.v4.b64 {%rd7, %rd8, %rd9, %rd10}, [%rd2];
+; SM100:    st.global.L2::evict_first.v4.b64 [%rd1], {%rd7, %rd8, %rd9, %rd10};
   call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) align 32 %dest, ptr addrspace(1) align 32 %src, i64 64, i1 false), !mem.cache_hint !107
   ret void
 }

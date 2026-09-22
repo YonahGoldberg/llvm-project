@@ -38,6 +38,12 @@ public:
                           const CallBase &I, MachineFunction &MF,
                           unsigned Intrinsic) const override;
 
+  bool findOptimalMemOpLowering(LLVMContext &Context, std::vector<EVT> &MemOps,
+                                unsigned Limit, const MemOp &Op, unsigned DstAS,
+                                unsigned SrcAS,
+                                const AttributeList &FuncAttributes,
+                                EVT *LargestVT = nullptr) const override;
+
   // Helper for getting a function parameter name. Name is composed from
   // its index and the function name. Negative index corresponds to special
   // parameter (unsized array) used for passing variable arguments.

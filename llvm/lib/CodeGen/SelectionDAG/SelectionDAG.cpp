@@ -9507,11 +9507,12 @@ getMemcpyLoadsAndStores(SelectionDAG &DAG, const SDLoc &dl, SDValue Chain,
   bool CopyFromConstant = !isVol && isMemSrcFromConstant(Src, Slice);
   bool isZeroConstant = CopyFromConstant && Slice.Array == nullptr;
   unsigned Limit = AlwaysInline ? ~0U : TLI.getMaxStoresPerMemcpy(OptSize);
-  const MemOp Op = isZeroConstant
-                       ? MemOp::Set(Size, DstAlignCanChange, DstAlign,
-                                    /*IsZeroMemset*/ true, isVol)
-                       : MemOp::Copy(Size, DstAlignCanChange, DstAlign,
-                                     SrcAlign, isVol, CopyFromConstant);
+  const MemOp Op =
+      isZeroConstant
+          ? MemOp::Set(Size, DstAlignCanChange, DstAlign,
+                       /*IsZeroMemset*/ true, isVol, DstMemCacheHint)
+          : MemOp::Copy(Size, DstAlignCanChange, DstAlign, SrcAlign, isVol,
+                        CopyFromConstant, DstMemCacheHint, SrcMemCacheHint);
   if (!TLI.findOptimalMemOpLowering(
           C, MemOps, Limit, Op, DstPtrInfo.getAddrSpace(),
           SrcPtrInfo.getAddrSpace(), MF.getFunction().getAttributes(), nullptr))
@@ -9592,6 +9593,38 @@ getMemcpyLoadsAndStores(SelectionDAG &DAG, const SDLoc &dl, SDValue Chain,
             MMOMetadata(NewAAInfo, /*Ranges=*/nullptr, DstMemCacheHint));
         OutChains.push_back(Store);
       }
+    }
+
+    // Some targets custom-lower load/store operations whose value type is
+    // otherwise illegal. Emit those operations directly so target lowering can
+    // transform them before generic type legalization.
+    bool HasCustomLoadStore =
+        (DstMemCacheHint || SrcMemCacheHint) && !TLI.isTypeLegal(VT) &&
+        TLI.getOperationAction(ISD::LOAD, VT) == TargetLowering::Custom &&
+        TLI.getOperationAction(ISD::STORE, VT) == TargetLowering::Custom;
+    if (!Store.getNode() && HasCustomLoadStore) {
+      bool isDereferenceable =
+          SrcPtrInfo.getWithOffset(SrcOff).isDereferenceable(VTSize, C, DL);
+      MachineMemOperand::Flags SrcMMOFlags = MMOFlags;
+      if (isDereferenceable)
+        SrcMMOFlags |= MachineMemOperand::MODereferenceable;
+      if (isConstant)
+        SrcMMOFlags |= MachineMemOperand::MOInvariant;
+
+      Value = DAG.getLoad(
+          VT, dl, Chain,
+          DAG.getObjectPtrOffset(dl, Src, TypeSize::getFixed(SrcOff)),
+          SrcPtrInfo.getWithOffset(SrcOff), commonAlignment(SrcAlign, SrcOff),
+          SrcMMOFlags,
+          MMOMetadata(NewAAInfo, /*Ranges=*/nullptr, SrcMemCacheHint));
+      OutLoadChains.push_back(Value.getValue(1));
+
+      Store = DAG.getStore(
+          Chain, dl, Value,
+          DAG.getObjectPtrOffset(dl, Dst, TypeSize::getFixed(DstOff)),
+          DstPtrInfo.getWithOffset(DstOff), DstAlign, MMOFlags,
+          MMOMetadata(NewAAInfo, /*Ranges=*/nullptr, DstMemCacheHint));
+      OutStoreChains.push_back(Store);
     }
 
     if (!Store.getNode()) {

@@ -141,10 +141,14 @@ private:
   MemOpKind Kind;
   Align SrcAlign; // Inferred alignment of the source or default value if the
                   // memory operation does not need to load the value.
+  const MDNode *DstMemCacheHint;
+  const MDNode *SrcMemCacheHint;
+
 public:
   static MemOp Copy(uint64_t Size, bool DstAlignCanChange, Align DstAlign,
-                    Align SrcAlign, bool IsVolatile,
-                    bool MemcpyStrSrc = false) {
+                    Align SrcAlign, bool IsVolatile, bool MemcpyStrSrc = false,
+                    const MDNode *DstMemCacheHint = nullptr,
+                    const MDNode *SrcMemCacheHint = nullptr) {
     MemOp Op;
     Op.Size = Size;
     Op.DstAlignCanChange = DstAlignCanChange;
@@ -152,6 +156,8 @@ public:
     Op.IsVolatile = IsVolatile;
     Op.Kind = MemcpyStrSrc ? MemOpKind::MemcpyStrSrc : MemOpKind::Memcpy;
     Op.SrcAlign = SrcAlign;
+    Op.DstMemCacheHint = DstMemCacheHint;
+    Op.SrcMemCacheHint = SrcMemCacheHint;
     return Op;
   }
 
@@ -164,17 +170,22 @@ public:
     Op.IsVolatile = IsVolatile;
     Op.Kind = MemOpKind::Memmove;
     Op.SrcAlign = SrcAlign;
+    Op.DstMemCacheHint = nullptr;
+    Op.SrcMemCacheHint = nullptr;
     return Op;
   }
 
   static MemOp Set(uint64_t Size, bool DstAlignCanChange, Align DstAlign,
-                   bool IsZeroMemset, bool IsVolatile) {
+                   bool IsZeroMemset, bool IsVolatile,
+                   const MDNode *DstMemCacheHint = nullptr) {
     MemOp Op;
     Op.Size = Size;
     Op.DstAlignCanChange = DstAlignCanChange;
     Op.DstAlign = DstAlign;
     Op.IsVolatile = IsVolatile;
     Op.Kind = IsZeroMemset ? MemOpKind::MemsetWithZero : MemOpKind::Memset;
+    Op.DstMemCacheHint = DstMemCacheHint;
+    Op.SrcMemCacheHint = nullptr;
     return Op;
   }
 
@@ -198,6 +209,8 @@ public:
   }
   bool isZeroMemset() const { return Kind == MemOpKind::MemsetWithZero; }
   bool isMemcpyStrSrc() const { return Kind == MemOpKind::MemcpyStrSrc; }
+  const MDNode *getDstMemCacheHint() const { return DstMemCacheHint; }
+  const MDNode *getSrcMemCacheHint() const { return SrcMemCacheHint; }
   Align getSrcAlign() const {
     assert(isMemcpyOrMemmove() && "Must be a memcpy or memmove");
     return SrcAlign;
