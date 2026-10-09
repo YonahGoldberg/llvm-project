@@ -86,7 +86,10 @@ void DAGTypeLegalizer::ScalarizeVectorResult(SDNode *N, unsigned ResNo) {
     R = ScalarizeVecRes_ATOMIC_LOAD(cast<AtomicSDNode>(N));
     break;
   case ISD::ATOMIC_SWAP:
-    R = ScalarizeVecRes_ATOMIC_SWAP(cast<AtomicSDNode>(N));
+  case ISD::ATOMIC_LOAD_AND:
+  case ISD::ATOMIC_LOAD_OR:
+  case ISD::ATOMIC_LOAD_XOR:
+    R = ScalarizeVecRes_ATOMIC_RMW(cast<AtomicSDNode>(N));
     break;
   case ISD::LOAD:           R = ScalarizeVecRes_LOAD(cast<LoadSDNode>(N));break;
   case ISD::SCALAR_TO_VECTOR:  R = ScalarizeVecRes_SCALAR_TO_VECTOR(N); break;
@@ -596,9 +599,9 @@ SDValue DAGTypeLegalizer::ScalarizeVecRes_ATOMIC_LOAD(AtomicSDNode *N) {
   return Result;
 }
 
-SDValue DAGTypeLegalizer::ScalarizeVecRes_ATOMIC_SWAP(AtomicSDNode *N) {
-  SDValue Swap = BitcastToInt_ATOMIC_SWAP(N);
-  return DAG.getBitcast(N->getValueType(0).getVectorElementType(), Swap);
+SDValue DAGTypeLegalizer::ScalarizeVecRes_ATOMIC_RMW(AtomicSDNode *N) {
+  SDValue RMW = BitcastToInt_ATOMIC_RMW(N);
+  return DAG.getBitcast(N->getValueType(0).getVectorElementType(), RMW);
 }
 
 SDValue DAGTypeLegalizer::ScalarizeVecRes_LOAD(LoadSDNode *N) {
@@ -1458,7 +1461,10 @@ void DAGTypeLegalizer::SplitVectorResult(SDNode *N, unsigned ResNo) {
     SplitVecRes_ATOMIC_LOAD(cast<AtomicSDNode>(N), Lo, Hi);
     break;
   case ISD::ATOMIC_SWAP:
-    SplitVecRes_ATOMIC_SWAP(cast<AtomicSDNode>(N), Lo, Hi);
+  case ISD::ATOMIC_LOAD_AND:
+  case ISD::ATOMIC_LOAD_OR:
+  case ISD::ATOMIC_LOAD_XOR:
+    SplitVecRes_ATOMIC_RMW(cast<AtomicSDNode>(N), Lo, Hi);
     break;
   case ISD::LOAD:
     SplitVecRes_LOAD(cast<LoadSDNode>(N), Lo, Hi);
@@ -2456,16 +2462,22 @@ void DAGTypeLegalizer::SplitVecRes_ATOMIC_LOAD(AtomicSDNode *LD, SDValue &Lo,
   ReplaceValueWith(SDValue(LD, 1), ALD.getValue(1));
 }
 
-void DAGTypeLegalizer::SplitVecRes_ATOMIC_SWAP(AtomicSDNode *N, SDValue &Lo,
-                                               SDValue &Hi) {
+void DAGTypeLegalizer::SplitVecRes_ATOMIC_RMW(AtomicSDNode *N, SDValue &Lo,
+                                              SDValue &Hi) {
   EVT LoVT, HiVT;
   std::tie(LoVT, HiVT) = DAG.GetSplitDestVTs(N->getValueType(0));
 
-  SDValue Swap = BitcastToInt_ATOMIC_SWAP(N);
+  SDValue RMW = BitcastToInt_ATOMIC_RMW(N);
   EVT LoIntVT = EVT::getIntegerVT(*DAG.getContext(), LoVT.getSizeInBits());
   EVT HiIntVT = EVT::getIntegerVT(*DAG.getContext(), HiVT.getSizeInBits());
+  if (DAG.getDataLayout().isBigEndian())
+    std::swap(LoIntVT, HiIntVT);
+
   SDValue LoInt, HiInt;
-  SplitInteger(Swap, LoIntVT, HiIntVT, LoInt, HiInt);
+  SplitInteger(RMW, LoIntVT, HiIntVT, LoInt, HiInt);
+
+  if (DAG.getDataLayout().isBigEndian())
+    std::swap(LoInt, HiInt);
 
   Lo = DAG.getBitcast(LoVT, LoInt);
   Hi = DAG.getBitcast(HiVT, HiInt);
@@ -5358,7 +5370,10 @@ void DAGTypeLegalizer::WidenVectorResult(SDNode *N, unsigned ResNo) {
     Res = WidenVecRes_ATOMIC_LOAD(cast<AtomicSDNode>(N));
     break;
   case ISD::ATOMIC_SWAP:
-    Res = WidenVecRes_ATOMIC_SWAP(cast<AtomicSDNode>(N));
+  case ISD::ATOMIC_LOAD_AND:
+  case ISD::ATOMIC_LOAD_OR:
+  case ISD::ATOMIC_LOAD_XOR:
+    Res = WidenVecRes_ATOMIC_RMW(cast<AtomicSDNode>(N));
     break;
   case ISD::LOAD:              Res = WidenVecRes_LOAD(N); break;
   case ISD::STEP_VECTOR:
@@ -6862,13 +6877,12 @@ SDValue DAGTypeLegalizer::WidenVecRes_ATOMIC_LOAD(AtomicSDNode *LD) {
   return Result;
 }
 
-SDValue DAGTypeLegalizer::WidenVecRes_ATOMIC_SWAP(AtomicSDNode *N) {
+SDValue DAGTypeLegalizer::WidenVecRes_ATOMIC_RMW(AtomicSDNode *N) {
   EVT VT = N->getValueType(0);
   EVT WidenVT = TLI.getTypeToTransformTo(*DAG.getContext(), VT);
-  SDValue Swap = BitcastToInt_ATOMIC_SWAP(N);
-  return coerceLoadedValue(Swap, Swap.getValueType(), WidenVT,
-                           VT.getSizeInBits(), Swap.getValueSizeInBits(),
-                           SDLoc(N), DAG);
+  SDValue RMW = BitcastToInt_ATOMIC_RMW(N);
+  return coerceLoadedValue(RMW, RMW.getValueType(), WidenVT, VT.getSizeInBits(),
+                           RMW.getValueSizeInBits(), SDLoc(N), DAG);
 }
 
 SDValue DAGTypeLegalizer::WidenVecRes_LOAD(SDNode *N) {

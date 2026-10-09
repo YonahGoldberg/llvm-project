@@ -802,16 +802,24 @@ void TargetLoweringBase::initActions() {
     }
   }
 
-  // Atomic exchange operates on the bit representation, so promote
-  // non-integer types to an integer type of the same width.
-  for (auto VTs : {MVT::fp_valuetypes(), MVT::fixedlen_vector_valuetypes()}) {
-    for (MVT VT : VTs) {
-      MVT IntVT = MVT::getIntegerVT(VT.getFixedSizeInBits());
-      if (IntVT.isValid()) {
-        setOperationAction(ISD::ATOMIC_SWAP, VT, Promote);
-        AddPromotedToType(ISD::ATOMIC_SWAP, VT, IntVT);
-      }
-    }
+  // Atomic exchange and bitwise RMWs operate on the bit representation, so
+  // promote them to an integer type of the same width where possible.
+  auto PromoteAtomicToInteger = [this](ISD::NodeType Op, MVT VT) {
+    MVT IntVT = MVT::getIntegerVT(VT.getFixedSizeInBits());
+    if (!IntVT.isValid())
+      return;
+    setOperationAction(Op, VT, Promote);
+    AddPromotedToType(Op, VT, IntVT);
+  };
+
+  for (MVT VT : MVT::fp_valuetypes())
+    PromoteAtomicToInteger(ISD::ATOMIC_SWAP, VT);
+  for (MVT VT : MVT::fixedlen_vector_valuetypes())
+    PromoteAtomicToInteger(ISD::ATOMIC_SWAP, VT);
+  for (MVT VT : MVT::integer_fixedlen_vector_valuetypes()) {
+    PromoteAtomicToInteger(ISD::ATOMIC_LOAD_AND, VT);
+    PromoteAtomicToInteger(ISD::ATOMIC_LOAD_OR, VT);
+    PromoteAtomicToInteger(ISD::ATOMIC_LOAD_XOR, VT);
   }
 
   // If f16 fma is not natively supported, the value must be promoted to an f64

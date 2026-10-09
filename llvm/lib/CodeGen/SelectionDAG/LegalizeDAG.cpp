@@ -6217,6 +6217,9 @@ void SelectionDAGLegalize::PromoteNode(SDNode *Node) {
     break;
   }
   case ISD::ATOMIC_SWAP:
+  case ISD::ATOMIC_LOAD_AND:
+  case ISD::ATOMIC_LOAD_OR:
+  case ISD::ATOMIC_LOAD_XOR:
   case ISD::ATOMIC_STORE: {
     AtomicSDNode *AM = cast<AtomicSDNode>(Node);
     SDLoc SL(Node);
@@ -6224,7 +6227,7 @@ void SelectionDAGLegalize::PromoteNode(SDNode *Node) {
     assert(NVT.getSizeInBits() == OVT.getSizeInBits() &&
            "unexpected promotion type");
     assert(AM->getMemoryVT().getSizeInBits() == NVT.getSizeInBits() &&
-           "unexpected atomic_swap with illegal type");
+           "unexpected atomic operation with illegal type");
 
     SDValue Op0 = AM->getBasePtr();
     SDValue Op1 = CastVal;

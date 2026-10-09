@@ -867,15 +867,21 @@ SDValue DAGTypeLegalizer::BitConvertToInteger(SDValue Op) {
                      EVT::getIntegerVT(*DAG.getContext(), BitWidth), Op);
 }
 
-/// Convert an atomic swap to operate on an integer of the same size.
-SDValue DAGTypeLegalizer::BitcastToInt_ATOMIC_SWAP(SDNode *N) {
+/// Convert an atomic RMW to operate on an integer of the same size.
+SDValue DAGTypeLegalizer::BitcastToInt_ATOMIC_RMW(SDNode *N) {
   AtomicSDNode *AM = cast<AtomicSDNode>(N);
   SDLoc SL(N);
+
+  assert((AM->getOpcode() == ISD::ATOMIC_SWAP ||
+          AM->getOpcode() == ISD::ATOMIC_LOAD_AND ||
+          AM->getOpcode() == ISD::ATOMIC_LOAD_OR ||
+          AM->getOpcode() == ISD::ATOMIC_LOAD_XOR) &&
+         "unsupported atomic RMW opcode");
 
   SDValue CastVal = BitConvertToInteger(AM->getVal());
   EVT CastVT = CastVal.getValueType();
   SDValue NewAtomic = DAG.getAtomic(
-      ISD::ATOMIC_SWAP, SL, CastVT, DAG.getVTList(CastVT, MVT::Other),
+      AM->getOpcode(), SL, CastVT, DAG.getVTList(CastVT, MVT::Other),
       {AM->getChain(), AM->getBasePtr(), CastVal}, AM->getMemOperand());
 
   // Legalize the chain result by replacing uses of the old value chain with
